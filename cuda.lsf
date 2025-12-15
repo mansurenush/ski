@@ -1,0 +1,6 @@
+#BSUB -n 2
+#BSUB -o "./test.out"
+#BSUB -e "./test.err"
+#BSUB -R "span[ptile=2]"
+#BSUB -gpu "num=2:mode=exclusive_process"
+mpiexec ./poisson_mpi_cuda --M 4096 --N 4096
