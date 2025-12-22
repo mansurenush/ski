@@ -1,11 +1,11 @@
 # Makefile (MPI + CUDA) per requirements: ARCH=sm_<N> (35/60), HOST_COMP=mpicc. [file:2]
 
-ARCH      ?= sm_35
-HOST_COMP ?= mpicc
+ARCH      ?= sm_60
+HOST_COMP ?= mpicxx
 NVCC      ?= nvcc
 
 CXXSTD    ?= c++11
-NVFLAGS   = -O3 -std=$(CXXSTD) -arch=$(ARCH) -Xcompiler "-O3"
+NVFLAGS   = -arch=$(ARCH) -ccbin $(HOST_COMP) -O3 -Xcompiler -Wall,-fPIC -std=c++11
 
 TARGET    = poisson_mpi_cuda
 SRC       = poisson_mpi_cuda.cu
@@ -13,8 +13,9 @@ SRC       = poisson_mpi_cuda.cu
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(NVCC) $(NVFLAGS) -ccbin $(HOST_COMP) -o $@ $<
+	$(NVCC) $(NVFLAGS) -o $@ $< $(LIBS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) *.o
 
+.PHONY: all clean
