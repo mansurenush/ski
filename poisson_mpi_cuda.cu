@@ -143,14 +143,14 @@ __global__ void kernel_compute_coeff_F(
   double aval;
   if (inA0 && inA1) aval = 1.0;
   else if (!inA0 && !inA1) aval = 1.0 / eps;
-  else aval = 0.5 + 0.5 / eps;
+  else aval = 0.5 / (h2 * h2) + 0.5 / eps;
 
   bool inB0 = inDomain(x_imh, y_jmh);
   bool inB1 = inDomain(x_iph, y_jmh);
   double bval;
   if (inB0 && inB1) bval = 1.0;
   else if (!inB0 && !inB1) bval = 1.0 / eps;
-  else bval = 0.5 + 0.5 / eps;
+  else bval = 0.5 / (h1 * h1) + 0.5 / eps;
 
   int idx = i * pitch + j;
   a[idx] = aval;
@@ -227,22 +227,10 @@ __global__ void kernel_copy(int n, const double* x, double* y) {
   if (i < n) y[i] = x[i];
 }
 
-__global__ void kernel_combine_r(int localM, int localN, const double* F, const double* Aw, double* r) {
-  int i = 1 + blockIdx.y * blockDim.y + threadIdx.y;
-  int j = 1 + blockIdx.x * blockDim.x + threadIdx.x;
-  int pitch = localN + 2;
-  if (i > localM || j > localN) return;
-  int c = i * pitch + j;
-  r[c] = F[c] - Aw[c];
-}
-
-__global__ void kernel_r_update(int localM, int localN, double alpha, const double* Ap, double* r) {
-  int i = 1 + blockIdx.y * blockDim.y + threadIdx.y;
-  int j = 1 + blockIdx.x * blockDim.x + threadIdx.x;
-  int pitch = localN + 2;
-  if (i > localM || j > localN) return;
-  int c = i * pitch + j;
-  r[c] -= alpha * Ap[c];
+__global__ void kernel_r_init(int n, const double* F, double* r) {
+  // r = F - r  
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) r[i] = F[i] - r[i];
 }
 
 // ---- pack/unpack halo (bulk) ----
@@ -488,7 +476,7 @@ int main(int argc, char** argv) {
   int total = (d.localM + 2) * (d.localN + 2);
 
   double* da = nullptr, * db = nullptr, * dF = nullptr;
-  double* dw = nullptr, * dr = nullptr, * dz = nullptr, * dp = nullptr, * dAp = nullptr, * dTmp = nullptr;
+  double* dw = nullptr, * dr = nullptr, * dz = nullptr, * dp = nullptr, * dAp = nullptr;
 
   CUDA_CHECK(cudaMalloc(&da, total * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&db, total * sizeof(double)));
@@ -498,7 +486,6 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMalloc(&dz, total * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&dp, total * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&dAp, total * sizeof(double)));
-  CUDA_CHECK(cudaMalloc(&dTmp, total * sizeof(double)));
 
   kernel_init0 << <(total + 255) / 256, 256 >> > (dw, total);
   kernel_init0 << <(total + 255) / 256, 256 >> > (da, total);
@@ -549,18 +536,18 @@ int main(int argc, char** argv) {
 
   // r0 = F - A w0
   cudaEventRecord(evStart);
-  kernel_applyA << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dw, dTmp);
+  kernel_applyA << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dw, dr);
   cudaEventRecord(evStop);
   CUDA_CHECK(cudaEventSynchronize(evStop));
   float msA = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msA, evStart, evStop));
   timers.t_applyA += msA * 1e-3;
 
   cudaEventRecord(evStart);
-  kernel_combine_r << <grdOp, blk2 >> > (d.localM, d.localN, dF, dTmp, dr);
+  kernel_r_init << <(total + 255) / 256, 256 >> > (total, dF, dr);
   cudaEventRecord(evStop);
   CUDA_CHECK(cudaEventSynchronize(evStop));
-  float msCr = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msCr, evStart, evStop));
-  timers.t_combine_r += msCr * 1e-3;
+  float msRinit = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msRinit, evStart, evStop));
+  timers.t_combine_r += msRinit * 1e-3;
 
   cudaEventRecord(evStart);
   kernel_applyDinv << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dr, dz);
@@ -576,69 +563,129 @@ int main(int argc, char** argv) {
   double zr = gpu_dot_mpi(d, dz, dr, dPartials, hPartials.data(),
     dotBlocks, dotThreads, evStart, evStop,
     MPI_COMM_WORLD, &timers) * hscale;
-  double rnorm = std::sqrt(gpu_dot_mpi(d, dr, dr, dPartials, hPartials.data(),
+
+  exchange_boundaries_bulk(d, dp, hb, evStart, evStop, MPI_COMM_WORLD, &timers);
+
+  cudaEventRecord(evStart);
+  kernel_applyA << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dp, dAp);
+  cudaEventRecord(evStop);
+  CUDA_CHECK(cudaEventSynchronize(evStop));
+  float msAp = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&msAp, evStart, evStop));
+  timers.t_applyA += msAp * 1e-3;
+
+  double pAp = gpu_dot_mpi(d, dAp, dp, dPartials, hPartials.data(),
     dotBlocks, dotThreads, evStart, evStop,
-    MPI_COMM_WORLD, &timers) * hscale);
+    MPI_COMM_WORLD, &timers) * hscale;
 
   int it = 0;
-  double finalResidual = rnorm;
+  double finalResidual = 0.0;
 
-  for (it = 0; it < MAXITER; ++it) {
-    exchange_boundaries_bulk(d, dp, hb, evStart, evStop, MPI_COMM_WORLD, &timers);
-
-    cudaEventRecord(evStart);
-    kernel_applyA << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dp, dAp);
-    cudaEventRecord(evStop);
-    CUDA_CHECK(cudaEventSynchronize(evStop));
-    float msAp = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msAp, evStart, evStop));
-    timers.t_applyA += msAp * 1e-3;
-
-    double pAp = gpu_dot_mpi(d, dAp, dp, dPartials, hPartials.data(),
+  if (fabs(pAp) < 1e-14) {
+    double rnorm = std::sqrt(gpu_dot_mpi(d, dr, dr, dPartials, hPartials.data(),
       dotBlocks, dotThreads, evStart, evStop,
-      MPI_COMM_WORLD, &timers) * hscale;
-    if (fabs(pAp) < 1e-30) break;
-
+      MPI_COMM_WORLD, &timers) * hscale);
+    finalResidual = rnorm;
+    it = 0;
+  }
+  else {
     double alpha = zr / pAp;
 
+    // w += alpha * p
     cudaEventRecord(evStart);
     kernel_axpy << <(total + 255) / 256, 256 >> > (total, alpha, dp, dw);
     cudaEventRecord(evStop);
     CUDA_CHECK(cudaEventSynchronize(evStop));
-    float msAx = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msAx, evStart, evStop));
+    float msAx = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&msAx, evStart, evStop));
     timers.t_axpy += msAx * 1e-3;
 
-    cudaEventRecord(evStart);
-    kernel_r_update << <grdOp, blk2 >> > (d.localM, d.localN, alpha, dAp, dr);
-    cudaEventRecord(evStop);
-    CUDA_CHECK(cudaEventSynchronize(evStop));
-    float msRu = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msRu, evStart, evStop));
-    timers.t_rupdate += msRu * 1e-3;
+    // MAIN LOOP
+    for (it = 1; it < MAXITER; ++it) {
+      // r -= alpha * Ap
+      cudaEventRecord(evStart);
+      kernel_axpy << <(total + 255) / 256, 256 >> > (total, -alpha, dAp, dr);
+      cudaEventRecord(evStop);
+      CUDA_CHECK(cudaEventSynchronize(evStop));
+      float msRu = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&msRu, evStart, evStop));
+      timers.t_rupdate += msRu * 1e-3;
 
-    rnorm = std::sqrt(gpu_dot_mpi(d, dr, dr, dPartials, hPartials.data(),
-      dotBlocks, dotThreads, evStart, evStop,
-      MPI_COMM_WORLD, &timers) * hscale);
-    finalResidual = rnorm;
-    if (rnorm < TOL) break;
+      double rnorm = std::sqrt(gpu_dot_mpi(d, dr, dr, dPartials, hPartials.data(),
+        dotBlocks, dotThreads, evStart, evStop,
+        MPI_COMM_WORLD, &timers) * hscale);
+      finalResidual = rnorm;
+      if (rnorm < TOL) break;
 
-    cudaEventRecord(evStart);
-    kernel_applyDinv << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dr, dz);
-    cudaEventRecord(evStop);
-    CUDA_CHECK(cudaEventSynchronize(evStop));
-    float msDn = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msDn, evStart, evStop));
-    timers.t_Dinv += msDn * 1e-3;
+      // z = D^{-1} r
+      cudaEventRecord(evStart);
+      kernel_applyDinv << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dr, dz);
+      cudaEventRecord(evStop);
+      CUDA_CHECK(cudaEventSynchronize(evStop));
+      float msDn = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&msDn, evStart, evStop));
+      timers.t_Dinv += msDn * 1e-3;
 
-    double zrNew = gpu_dot_mpi(d, dz, dr, dPartials, hPartials.data(),
-      dotBlocks, dotThreads, evStart, evStop,
-      MPI_COMM_WORLD, &timers) * hscale;
-    double beta = zrNew / zr;
-    zr = zrNew;
+      double zrNew = gpu_dot_mpi(d, dz, dr, dPartials, hPartials.data(),
+        dotBlocks, dotThreads, evStart, evStop,
+        MPI_COMM_WORLD, &timers) * hscale;
 
-    cudaEventRecord(evStart);
-    kernel_xpay << <(total + 255) / 256, 256 >> > (total, dz, beta, dp);
-    cudaEventRecord(evStop);
-    CUDA_CHECK(cudaEventSynchronize(evStop));
-    float msXp = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msXp, evStart, evStop));
-    timers.t_xpay += msXp * 1e-3;
+      if (fabs(zr) < 1e-14) {
+        finalResidual = rnorm;
+        break;
+      }
+
+      double beta = zrNew / zr;
+      zr = zrNew;
+
+      // p = z + beta * p
+      cudaEventRecord(evStart);
+      kernel_xpay << <(total + 255) / 256, 256 >> > (total, dz, beta, dp);
+      cudaEventRecord(evStop);
+      CUDA_CHECK(cudaEventSynchronize(evStop));
+      float msXp = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&msXp, evStart, evStop));
+      timers.t_xpay += msXp * 1e-3;
+
+      exchange_boundaries_bulk(d, dp, hb, evStart, evStop, MPI_COMM_WORLD, &timers);
+
+      // Ap = A*p
+      cudaEventRecord(evStart);
+      kernel_applyA << <grdOp, blk2 >> > (d.localM, d.localN, g.h1, g.h2, da, db, dp, dAp);
+      cudaEventRecord(evStop);
+      CUDA_CHECK(cudaEventSynchronize(evStop));
+      float msAp2 = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&msAp2, evStart, evStop));
+      timers.t_applyA += msAp2 * 1e-3;
+
+      pAp = gpu_dot_mpi(d, dAp, dp, dPartials, hPartials.data(),
+        dotBlocks, dotThreads, evStart, evStop,
+        MPI_COMM_WORLD, &timers) * hscale;
+
+      if (fabs(pAp) < 1e-14) {
+        finalResidual = std::sqrt(gpu_dot_mpi(d, dr, dr, dPartials, hPartials.data(),
+          dotBlocks, dotThreads, evStart, evStop,
+          MPI_COMM_WORLD, &timers) * hscale);
+        break;
+      }
+
+      alpha = zr / pAp;
+
+      // w += alpha * p
+      cudaEventRecord(evStart);
+      kernel_axpy << <(total + 255) / 256, 256 >> > (total, alpha, dp, dw);
+      cudaEventRecord(evStop);
+      CUDA_CHECK(cudaEventSynchronize(evStop));
+      float msAx2 = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&msAx2, evStart, evStop));
+      timers.t_axpy += msAx2 * 1e-3;
+    }
+
+    if (it == MAXITER) {
+      finalResidual = std::sqrt(gpu_dot_mpi(d, dr, dr, dPartials, hPartials.data(),
+        dotBlocks, dotThreads, evStart, evStop,
+        MPI_COMM_WORLD, &timers) * hscale);
+    }
   }
 
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -655,7 +702,7 @@ int main(int argc, char** argv) {
   halo_free(hb);
 
   cudaFree(da); cudaFree(db); cudaFree(dF);
-  cudaFree(dw); cudaFree(dr); cudaFree(dz); cudaFree(dp); cudaFree(dAp); cudaFree(dTmp);
+  cudaFree(dw); cudaFree(dr); cudaFree(dz); cudaFree(dp); cudaFree(dAp);
 
   timers.t_finalize = MPI_Wtime() - t_fin0;
 
